@@ -1,0 +1,125 @@
+"""
+@author: dennybritz
+
+Modified for the ComposeNet project by Saurabh Kumar.
+"""
+
+import sys
+import os
+import itertools
+import numpy as np
+import tensorflow as tf
+import time
+import logging
+
+from estimators import ValueEstimator, PolicyEstimator
+from worker import make_copy_params_op
+
+
+def log_results(eval_logger, env_id, iteration, rewards, steps):
+  """Function that logs the reward statistics obtained by the agent.
+
+  Args:
+    logfile: File to log reward statistics.
+    iteration: The current iteration.
+    rewards: Array of rewards obtained in the current iteration.
+  """
+  eval_logger.info(('Iteration : {}, environment : {}, mean rewards = {}, median steps = {},'
+    ' max rewards = {}, max steps = {}.').format(
+    iteration, env_id, np.mean(rewards), np.median(steps), np.max(rewards),
+    np.max(steps)))
+
+class PolicyEval(object):
+  """
+  Helps evaluating a policy by running a fixed number of episodes in an environment,
+  and logging summary statistics to a text file.
+  Args:
+    env: environment to run in
+    policy_net: A policy estimator
+  """
+  def __init__(self, env, env_id, curriculum, policy_net, saver=None,
+      n_eval=10, logfile=None, checkpoint_path=None):
+
+    self.env = env
+    self.env_id = env_id
+    self.curriculum = curriculum
+    self.global_policy_net = policy_net
+    self.saver = saver
+    self.n_eval = n_eval
+    self.checkpoint_path = checkpoint_path
+    self.logger = logging.getLogger('eval runs {}'.format(env_id))
+    hdlr = logging.FileHandler(logfile)
+    formatter = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s')
+    hdlr.setFormatter(formatter)
+    self.logger.addHandler(hdlr)
+    self.logger.setLevel(logging.INFO)
+
+    # Local policy net
+    with tf.variable_scope("policy_eval_{}".format(env_id)):
+      self.policy_net = PolicyEstimator(policy_net.num_outputs, state_dims=self.env.get_state_size())
+
+    #Directory to save checkpoints to. Op to copy params from global policy/value net parameters
+    self.copy_params_op = make_copy_params_op(
+      tf.contrib.slim.get_variables(scope="global_{}".format(env_id), collection=tf.GraphKeys.TRAINABLE_VARIABLES),
+      tf.contrib.slim.get_variables(scope="policy_eval_{}".format(env_id), collection=tf.GraphKeys.TRAINABLE_VARIABLES))
+    self.epochs = 0
+
+  def _policy_net_predict(self, state, sess):
+    feed_dict = { self.policy_net.states: [state] }
+    preds = sess.run(self.policy_net.predictions, feed_dict)
+    return preds["probs"][0]
+
+  def eval(self, sess, n_eval):
+    with sess.as_default(), sess.graph.as_default():
+      # Copy params to local model
+      global_step, _ = sess.run([tf.contrib.framework.get_global_step(), self.copy_params_op])
+      if global_step > (self.epochs + 1) * 300000:
+        self.epochs += 1
+
+      eval_rewards = []
+      episode_lengths = []
+
+      for i in xrange(n_eval):
+        # Run an episode
+        done = False
+        if self.curriculum:
+          if self.epochs < len(self.curriculum):
+            state = self.env.reset(max_steps=self.curriculum[self.epochs])
+          else:
+            state = self.env.reset(max_steps=self.curriculum[-1])
+        else:
+          state = self.env.reset()
+        total_reward = 0.0
+        episode_length = 0
+        while not done:
+          action_probs = self._policy_net_predict(state, sess)
+          action = np.random.choice(np.arange(len(action_probs)), p=action_probs)
+          next_state, reward, done = self.env.step(action)
+          total_reward += reward
+          episode_length += 1
+          state = next_state
+        eval_rewards.append(total_reward)
+        episode_lengths.append(episode_length)
+
+      log_results(self.logger, self.env_id, global_step, eval_rewards, episode_lengths)
+
+      if self.saver is not None:
+        tf.add_to_collection('policy_train_op', self.policy_net.train_op)
+        tf.add_to_collection('action_probs', self.policy_net.probs)
+        tf.add_to_collection('state', self.policy_net.states)
+
+        self.saver.save(sess, self.checkpoint_path)
+
+      # tf.logging.info("Eval results at step {}: total_reward {}, episode_length {}".format(global_step, total_reward, episode_length))
+
+  def continuous_eval(self, eval_every, sess, coord):
+    """
+    Continuously evaluates the policy every [eval_every] seconds.
+    """
+    try:
+      while not coord.should_stop():
+        self.eval(sess, self.n_eval)
+        # Sleep until next evaluation cycle
+        time.sleep(eval_every)
+    except tf.errors.CancelledError:
+      return
